@@ -1,7 +1,7 @@
 use clang::{Entity, EntityKind, Type, TypeKind};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::Write;
-use std::collections::HashSet;
 
 // Type mapping from C to Cangjie
 fn map_c_type_to_cangjie(ty: &Type) -> String {
@@ -29,102 +29,190 @@ fn map_c_type_to_cangjie(ty: &Type) -> String {
                 format!("CPointer<{}>", map_c_type_to_cangjie(&pointee))
             }
         }
-        TypeKind::Record => {
-            // Get struct name
-            ty.get_declaration()
-                .map(|d| d.get_display_name())
-                .unwrap().unwrap()
+        TypeKind::Typedef => {
+            let canonical = ty.get_canonical_type();
+            map_c_type_to_cangjie(&canonical)
         }
-        _ => "Unit /* Unsupported type */".to_string()
+        TypeKind::Enum => "Int32".to_string(),
+        TypeKind::Record => ty.get_display_name(),
+        _ => format!("/* Unsupported type: {:?} */", ty.get_kind()),
     }
 }
 
-// Generate Cangjie struct from C struct
-fn generate_struct(entity: &Entity) -> String {
-    let struct_name = entity.get_display_name().unwrap();
-    let mut fields = Vec::new();
+struct BindingGenerator {
+    processed_types: HashSet<String>,
+    type_aliases: HashMap<String, String>,
+    output: String,
+}
 
-    for field in entity.get_children() {
-        if field.get_kind() == EntityKind::FieldDecl {
-            let field_name = field.get_display_name().unwrap();
-            let field_type = field.get_type().unwrap();
-            let cangjie_type = map_c_type_to_cangjie(&field_type);
-
-            // Generate field with default value
-            let default_value = match field_type.get_kind() {
-                TypeKind::Bool => "false",
-                TypeKind::Float | TypeKind::Double => "0.0",
-                TypeKind::Pointer => "CPointer()",
-                _ => "0"
-            };
-
-            fields.push(format!("    var {}: {} = {}", field_name, cangjie_type, default_value));
+impl BindingGenerator {
+    fn new() -> Self {
+        BindingGenerator {
+            processed_types: HashSet::new(),
+            type_aliases: HashMap::new(),
+            output: String::new(),
         }
     }
 
-    format!("@C\nstruct {} {{\n{}\n}}", struct_name, fields.join("\n"))
-}
+    fn process_enum(&mut self, entity: Entity) {
+        if self.processed_types.contains(&entity.get_name().unwrap_or_default()) {
+            return;
+        }
 
-// Generate Cangjie function declaration from C function
-fn generate_function(entity: &Entity) -> String {
-    let func_name = entity.get_display_name().unwrap();
-    let return_type = entity.get_result_type().unwrap();
-    let cangjie_return_type = map_c_type_to_cangjie(&return_type);
+        let name = entity.get_name().unwrap();
+        self.processed_types.insert(name.clone());
 
-    let mut params = Vec::new();
-    for param in entity.get_arguments().unwrap() {
-        let param_name = param.get_display_name().unwrap();
-        let param_type = param.get_type().unwrap();
-        let cangjie_param_type = map_c_type_to_cangjie(&param_type);
-        params.push(format!("{}: {}", param_name, cangjie_param_type));
+        let mut enum_def = format!("enum {} {{\n", name);
+
+        for child in entity.get_children() {
+            if let Some(val) = child.get_enum_constant_value() {
+                enum_def.push_str(&format!("    {} = {}\n",
+                                           child.get_name().unwrap(),
+                                           val.0));
+            }
+        }
+        enum_def.push_str("}\n\n");
+        self.output.push_str(&enum_def);
     }
 
-    format!("foreign func {}({}): {}",
-            func_name,
-            params.join(", "),
-            cangjie_return_type)
-}
+    fn process_struct(&mut self, entity: Entity) {
+        if self.processed_types.contains(&entity.get_name().unwrap_or_default()) {
+            return;
+        }
 
-pub fn generate_bindings(header_path: &str, output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
-    let clang = clang::Clang::new()?;
-    let index = clang::Index::new(&clang, false, false);
-    let tu = index.parser(header_path)
-        .parse()?;
+        let name = entity.get_name().unwrap();
+        self.processed_types.insert(name.clone());
 
-    let mut output = File::create(output_path)?;
-    let mut seen_types = HashSet::new();
+        let mut struct_def = format!("@C\nstruct {} {{\n", name);
 
-    // Write header comment
-    writeln!(output, "// Auto-generated Cangjie bindings from {}\n", header_path)?;
+        for field in entity.get_children() {
+            if field.get_kind() == EntityKind::FieldDecl {
+                let field_name = field.get_name().unwrap_or("unknown1".to_string());
+                let field_type = field.get_type().unwrap();
+                let cangjie_type = map_c_type_to_cangjie(&field_type);
 
-    // Process all entities in the translation unit
-    for entity in tu.get_entity().get_children() {
-        match entity.get_kind() {
-            EntityKind::StructDecl => {
-                if !seen_types.contains(&entity.get_display_name()) {
-                    writeln!(output, "{}\n", generate_struct(&entity))?;
-                    seen_types.insert(entity.get_display_name());
+                // Handle arrays
+                if field_type.get_kind() == TypeKind::ConstantArray {
+                    let size = field_type.get_size().unwrap_or(0);
+                    let element_type = field_type.get_element_type().unwrap();
+                    struct_def.push_str(&format!("    var {} = VArray<{}, ${}>(repeat: 0)\n",
+                                                 field_name,
+                                                 map_c_type_to_cangjie(&element_type),
+                                                 size));
+                } else {
+                    struct_def.push_str(&format!("    var {}: {} = {}\n",
+                                                 field_name,
+                                                 cangjie_type,
+                                                 get_default_value(&cangjie_type)));
                 }
             }
-            EntityKind::FunctionDecl => {
-                writeln!(output, "{}\n", generate_function(&entity))?;
-            }
-            _ => {}
         }
+        struct_def.push_str("}\n\n");
+        self.output.push_str(&struct_def);
     }
 
-    Ok(())
+    fn process_function(&mut self, entity: Entity) {
+        let func_name = entity.get_name().unwrap();
+        let return_type = entity.get_result_type().unwrap();
+        let cangjie_return_type = map_c_type_to_cangjie(&return_type);
+
+        let mut func_def = format!("foreign func {}(", func_name);
+
+        // Process parameters
+        let mut first = true;
+        for param in entity.get_arguments().unwrap() {
+            if !first {
+                func_def.push_str(", ");
+            }
+            first = false;
+
+            let param_name = param.get_name().unwrap_or("arg".to_string());
+            let param_type = param.get_type().unwrap();
+            let cangjie_param_type = map_c_type_to_cangjie(&param_type);
+
+            func_def.push_str(&format!("{}: {}", param_name, cangjie_param_type));
+        }
+
+        func_def.push_str(&format!("): {}\n", cangjie_return_type));
+        self.output.push_str(&func_def);
+    }
+
+    fn process_typedef(&mut self, entity: Entity) {
+        let name = entity.get_name().unwrap();
+        let underlying_type = entity.get_type().unwrap().get_canonical_type();
+        let cangjie_type = map_c_type_to_cangjie(&underlying_type);
+
+        self.type_aliases.insert(name.clone(), cangjie_type.clone());
+    }
+
+    fn generate_bindings(&mut self, header_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+        let clang = clang::Clang::new()?;
+        let index = clang::Index::new(&clang, false, true);
+        let tu = index.parser(header_path)
+            .arguments(&["-I", "T:\\cjbind-bootstrap\\include"])
+            .detailed_preprocessing_record(true)
+            .skip_function_bodies(true)
+            .parse()?;
+
+        let entity = tu.get_entity();
+
+        // First pass: collect all type definitions
+        for child in entity.get_children() {
+            match child.get_kind() {
+                EntityKind::TypedefDecl => self.process_typedef(child),
+                _ => {}
+            }
+        }
+
+        // Header
+        self.output.push_str("// Generated by C-to-Cangjie binding generator\n\n");
+
+        // Second pass: generate actual bindings
+        for child in entity.get_children() {
+            match child.get_kind() {
+                EntityKind::EnumDecl => self.process_enum(child),
+                EntityKind::StructDecl => self.process_struct(child),
+                EntityKind::FunctionDecl => self.process_function(child),
+                _ => {}
+            }
+        }
+
+        Ok(())
+    }
+
+    fn write_to_file(&self, output_path: &str) -> std::io::Result<()> {
+        let mut file = File::create(output_path)?;
+        file.write_all(self.output.as_bytes())?;
+        Ok(())
+    }
 }
 
-// Example usage
+fn get_default_value(ty: &str) -> String {
+    match ty {
+        "Unit" => "()".to_string(),
+        "Bool" => "false".to_string(),
+        t if t.starts_with("Int") || t.starts_with("UInt") => "0".to_string(),
+        t if t.starts_with("Float") => "0.0".to_string(),
+        t if t.starts_with("CPointer") => "CPointer()".to_string(),
+        "CString" => "CString()".to_string(),
+        _ => format!("{}()", ty)
+    }
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<String> = std::env::args().collect();
     if args.len() != 3 {
-        println!("Usage: {} <input.h> <output.cj>", args[0]);
+        eprintln!("Usage: {} <input.h> <output.cj>", args[0]);
         std::process::exit(1);
     }
 
-    generate_bindings(&args[1], &args[2])?;
-    println!("Successfully generated Cangjie bindings");
+    let input_path = &args[1];
+    let output_path = &args[2];
+
+    let mut generator = BindingGenerator::new();
+    generator.generate_bindings(input_path)?;
+    generator.write_to_file(output_path)?;
+
+    println!("Successfully generated bindings: {}", output_path);
     Ok(())
 }
