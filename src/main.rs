@@ -19,7 +19,7 @@ fn translate_type(ty: Type) -> String {
         clang::TypeKind::LongLong => "Int64".to_string(),
         clang::TypeKind::Float => "Float32".to_string(),
         clang::TypeKind::Double => "Float64".to_string(),
-        
+
         clang::TypeKind::Pointer => {
             let pointee = ty.get_pointee_type().unwrap();
             if pointee.get_kind() == clang::TypeKind::CharS {
@@ -33,6 +33,33 @@ fn translate_type(ty: Type) -> String {
             let decl = ty.get_declaration().unwrap();
             decl.get_name().unwrap().to_string()
         }
+        clang::TypeKind::Typedef => {
+            let underlying = ty.get_canonical_type();
+            translate_type(underlying)
+        }
+        clang::TypeKind::Enum => {
+            let decl = ty.get_declaration().unwrap();
+            decl.get_name().unwrap().to_string()
+        }
+        clang::TypeKind::ConstantArray => {
+            let element_type = ty.get_element_type().unwrap();
+            let size = ty.get_size().unwrap();
+            format!("VArray<{}, ${}>", translate_type(element_type), size)
+        }
+        clang::TypeKind::FunctionPrototype => {
+            let return_type = ty.get_result_type().unwrap();
+            let args: Vec<_> = ty.get_argument_types().unwrap().into_iter().collect();
+            let arg_types: Vec<_> = args.iter().map(|arg| translate_type(*arg)).collect();
+            format!(
+                "CFunc<({}) -> {}>",
+                arg_types.join(", "),
+                translate_type(return_type)
+            )
+        }
+        clang::TypeKind::FunctionNoPrototype => {
+            let return_type = ty.get_result_type().unwrap();
+            format!("CFunc<() -> {}>", translate_type(return_type))
+        }
         _ => {
             unreachable!("Unsupported type: {:?}", ty)
         }
@@ -42,38 +69,68 @@ fn translate_type(ty: Type) -> String {
 fn process_enum(entity: Entity, output: &mut File) -> std::io::Result<()> {
     // 处理注释
     if let Some(comment) = entity.get_comment() {
-        writeln!(output, "// {}", comment)?;
+        writeln!(output, "{}", comment)?;
     }
+    let tname = entity.get_name().unwrap();
+    writeln!(output, "type {} = Int32\n", tname)?;
 
     for child in entity.get_children() {
         if child.get_kind() == EntityKind::EnumConstantDecl {
+            if let Some(comment) = child.get_comment() {
+                writeln!(output, "{}", comment)?;
+            }
             let name = child.get_name().unwrap();
             let value = child.get_enum_constant_value().unwrap().0;
-            writeln!(output, "let {} = {}", name, value)?;
+            writeln!(output, "let {}: {} = {}\n", name, tname, value)?;
         }
     }
     Ok(())
 }
 
 fn process_struct(entity: Entity, output: &mut File) -> std::io::Result<()> {
-    let name = entity.get_name().unwrap_or("Anonymous".to_string());
+    let name = entity.get_name().unwrap();
 
     // 处理注释
     if let Some(comment) = entity.get_comment() {
-        writeln!(output, "// {}", comment)?;
+        writeln!(output, "{}", comment)?;
     }
 
     writeln!(output, "@C")?;
     writeln!(output, "struct {} {{", name)?;
 
+    let mut bitfields: Vec<(Entity<'_>, usize)> = Vec::new();
+
     for field in entity.get_children() {
         if field.get_kind() == EntityKind::FieldDecl {
-            let field_name = field.get_name().unwrap_or_else(||
-                {
-                    println!("Field without name in struct {}", name);
-                    "Anonymous".to_string()
+            if let Some(bit_width) = field.get_bit_field_width() {
+                bitfields.push((field, bit_width));
+                continue;
+            } else {
+                if !bitfields.is_empty() {
+                    let total_bits: usize =
+                        bitfields.iter().map(|(_, width)| *width as usize).sum();
+                    if total_bits % 8 != 0 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::Other,
+                            "位域总位数不是8的倍数",
+                        ));
+                    }
+                    writeln!(output, "    // 位域")?;
+                    for (field, width) in bitfields.drain(..) {
+                        let field_name = field.get_name().unwrap_or("unnamed".to_string());
+                        let field_type = field.get_type().unwrap().get_display_name();
+                        writeln!(output, "    // {} {} : {}", field_name, field_type, width)?;
+                    }
+                    bitfields.clear();
+                    writeln!(
+                        output,
+                        "    var bitfields: VArray<UInt8, ${}>",
+                        total_bits / 8
+                    )?;
                 }
-            );
+            }
+
+            let field_name = field.get_name().unwrap();
             let field_type = translate_type(field.get_type().unwrap());
 
             // 处理字段注释
@@ -81,13 +138,31 @@ fn process_struct(entity: Entity, output: &mut File) -> std::io::Result<()> {
                 writeln!(output, "    {}", comment)?;
             }
 
-            match field_type.as_str() {
-                "Bool" => writeln!(output, "    var {}: {} = false", field_name, field_type)?,
-                "Unit" => writeln!(output, "    var {}: {}", field_name, field_type)?,
-                t if t.starts_with("Float") => writeln!(output, "    var {}: {} = 0.0", field_name, field_type)?,
-                _ => writeln!(output, "    var {}: {} = 0", field_name, field_type)?
-            }
+            writeln!(output, "    var {}: {}", field_name, field_type)?
         }
+    }
+
+    // 处理结尾的位域
+    if !bitfields.is_empty() {
+        let total_bits: usize = bitfields.iter().map(|(_, width)| *width as usize).sum();
+        if total_bits % 8 != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                "位域总位数不是8的倍数",
+            ));
+        }
+        writeln!(output, "    // 位域")?;
+        for (field, width) in bitfields.drain(..) {
+            let field_name = field.get_name().unwrap_or("unnamed".to_string());
+            let field_type = field.get_type().unwrap().get_display_name();
+            writeln!(output, "    // {} {} : {}", field_name, field_type, width)?;
+        }
+        bitfields.clear();
+        writeln!(
+            output,
+            "    var bitfields: VArray<UInt8, ${}>",
+            total_bits / 8
+        )?;
     }
 
     writeln!(output, "}}")?;
@@ -101,7 +176,7 @@ fn process_function(entity: Entity, output: &mut File) -> std::io::Result<()> {
 
     // 处理注释
     if let Some(comment) = entity.get_comment() {
-        writeln!(output, "// {}", comment)?;
+        writeln!(output, "{}", comment)?;
     }
 
     write!(output, "foreign func {}(", name)?;
@@ -128,18 +203,27 @@ fn process_typedef(entity: Entity, output: &mut File) -> std::io::Result<()> {
 
     // 处理注释
     if let Some(comment) = entity.get_comment() {
-        writeln!(output, "// {}", comment)?;
+        writeln!(output, "{}", comment)?;
     }
 
-    writeln!(output, "type {} = {}", name, translate_type(underlying_type))?;
+    writeln!(
+        output,
+        "type {} = {}",
+        name,
+        translate_type(underlying_type)
+    )?;
     writeln!(output)?;
     Ok(())
 }
 
-pub fn generate_bindings(header_path: &str, output_path: &str) -> Result<(), Box<dyn std::error::Error>> {
+pub fn generate_bindings(
+    header_path: &str,
+    output_path: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
     let clang = Clang::new()?;
     let index = clang::Index::new(&clang, false, true);
-    let tu = index.parser(header_path)
+    let tu = index
+        .parser(header_path)
         .arguments(&["-I", "T:\\cjbind-bootstrap\\include"])
         .detailed_preprocessing_record(true)
         .skip_function_bodies(true)
@@ -148,7 +232,10 @@ pub fn generate_bindings(header_path: &str, output_path: &str) -> Result<(), Box
     let mut output = File::create(Path::new(output_path))?;
 
     // 写入文件头
-    writeln!(output, "// This file is automatically generated. DO NOT EDIT.")?;
+    writeln!(
+        output,
+        "// This file is automatically generated. DO NOT EDIT."
+    )?;
     writeln!(output)?;
 
     for entity in tu.get_entity().get_children() {
@@ -157,7 +244,7 @@ pub fn generate_bindings(header_path: &str, output_path: &str) -> Result<(), Box
             EntityKind::StructDecl => process_struct(entity, &mut output)?,
             EntityKind::FunctionDecl => process_function(entity, &mut output)?,
             EntityKind::TypedefDecl => process_typedef(entity, &mut output)?,
-            _ => ()
+            _ => (),
         }
     }
 
