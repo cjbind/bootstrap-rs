@@ -200,6 +200,10 @@ fn process_function(entity: Entity, output: &mut File) -> std::io::Result<()> {
 fn process_typedef(entity: Entity, output: &mut File) -> std::io::Result<()> {
     let name = entity.get_name().unwrap();
     let underlying_type = entity.get_typedef_underlying_type().unwrap();
+    
+    if name == translate_type(underlying_type) {
+        return Ok(());
+    }
 
     // 处理注释
     if let Some(comment) = entity.get_comment() {
